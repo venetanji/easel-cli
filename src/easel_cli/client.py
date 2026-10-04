@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import math
 import mimetypes
+import os
 import re
+import stat
 import time
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -17,6 +21,58 @@ import httpx
 IMAGE_MODEL = "qwen-image-2.1"
 VIDEO_MODEL = "ltx-2.5"
 JOB_STATUSES = {"queued", "in_progress", "completed", "failed", "cancelled"}
+VIDEO_SIZES = ("512x320", "640x384", "768x512", "1280x720", "720x1280", "1792x1024", "1024x1792")
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+CAMERA_LORAS = ("dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static")
+
+
+@dataclass(frozen=True)
+class LoRASelection:
+    """Curated adapter ID and finite 0–2 model strength."""
+    id: str
+    strength: float = 1.0
+
+
+@dataclass(frozen=True)
+class GuideFrame:
+    """Local still image at an explicit pixel-frame position, with strength 0–1."""
+    image: Path
+    frame_index: int
+    strength: float = 1.0
+
+
+class LoRACatalogEntry(TypedDict, total=False):
+    id: str
+    kind: str
+    family: str
+    supported: bool
+    installed: bool
+    requires: list[str]
+    validation: str
+    files: list[dict[str, Any]]
+    repo_id: str
+    revision: str
+    collection: str
+    gated: bool
+    trigger: str | None
+    min_seconds: int
+    tested_workflows: list[str]
+
+
+class VideoCapabilities(TypedDict):
+    object: str
+    schema_version: int
+    model: str
+    fps: int
+    seconds: dict[str, int]
+    sizes: list[str]
+    default_size: str
+    seed: dict[str, str]
+    loras: dict[str, Any]
+    motion_speed: dict[str, Any]
+    lora_reference_strength: dict[str, Any]
+    uploads: dict[str, Any]
+    guiding_frames: dict[str, Any]
 
 
 class EaselError(Exception):
@@ -35,6 +91,51 @@ class EaselError(Exception):
 def _positive(value: float, name: str) -> None:
     if not math.isfinite(value) or value <= 0:
         raise EaselError(f"{name} must be a finite positive number")
+
+
+def _number(value: Any, name: str, minimum: float, maximum: float) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not minimum <= value <= maximum or not math.isfinite(value)):
+        raise EaselError(f"{name} must be a finite number between {minimum} and {maximum}")
+    return float(value)
+
+
+def _integer(value: Any, name: str, minimum: int, maximum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise EaselError(f"{name} must be an integer between {minimum} and {maximum}")
+
+
+def _lora_selections(value: str | list[LoRASelection] | None) -> list[LoRASelection]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if len(value) > 8192:
+            raise EaselError("loras JSON is too large (maximum 8192 characters)")
+        try:
+            requested = json.loads(value)
+        except (ValueError, RecursionError) as exc:
+            raise EaselError("loras must be a JSON array of id/strength objects") from exc
+        if not isinstance(requested, list):
+            raise EaselError("loras must be a JSON array of id/strength objects")
+        selections = []
+        for spec in requested:
+            if not isinstance(spec, dict) or set(spec) - {"id", "strength"} or "id" not in spec:
+                raise EaselError("each LoRA must have an id and optional strength")
+            selections.append(LoRASelection(spec["id"], spec.get("strength", 1)))
+    elif isinstance(value, list):
+        selections = value
+    else:
+        raise EaselError("loras must be LoRASelection objects or legacy JSON")
+    if len(selections) > 4:
+        raise EaselError("at most four LoRAs may be selected")
+    for selection in selections:
+        if (not isinstance(selection, LoRASelection) or not isinstance(selection.id, str)
+                or len(selection.id) > 128 or not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", selection.id)):
+            raise EaselError("LoRA id must be a registered identifier, never a path or URL; consult video loras")
+        _number(selection.strength, "LoRA strength", 0, 2)
+    if len({selection.id for selection in selections}) != len(selections):
+        raise EaselError("duplicate LoRA ids are not allowed")
+    return selections
 
 
 class EaselClient:
@@ -138,11 +239,25 @@ class EaselClient:
         except (KeyError, TypeError, AttributeError, ValueError) as exc:
             raise EaselError("Easel API returned an invalid models response") from exc
 
-    def list_loras(self) -> list[dict[str, Any]]:
+    def list_loras(self) -> list[LoRACatalogEntry]:
         data = self._get_json("/v1/videos/loras").get("data")
         if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
             raise EaselError("Easel API returned an invalid LoRA catalog")
-        return data
+        for item in data:
+            if (not isinstance(item.get("id"), str)
+                    or any(key in item and not isinstance(item[key], bool) for key in ("supported", "installed"))
+                    or ("requires" in item and (not isinstance(item["requires"], list)
+                        or any(not isinstance(field, str) for field in item["requires"])))
+                    or ("validation" in item and not isinstance(item["validation"], str))):
+                raise EaselError("Easel API returned an invalid LoRA catalog")
+        return cast(list[LoRACatalogEntry], data)
+
+    def video_capabilities(self) -> VideoCapabilities:
+        body = self._get_json("/v1/videos/capabilities")
+        if (body.get("object") != "video.capabilities" or type(body.get("schema_version")) is not int
+                or body["schema_version"] != 1):
+            raise EaselError("Easel API returned an unsupported video capabilities contract")
+        return cast(VideoCapabilities, body)
 
     @staticmethod
     def _upload(stack: ExitStack, path: Path) -> tuple[str, Any, str]:
@@ -150,7 +265,19 @@ class EaselClient:
         mime = mimetypes.guess_type(path.name)[0]
         if mime not in {"image/png", "image/jpeg", "image/webp"}:
             raise EaselError("Reference files must be PNG, JPEG or WebP")
-        return path.name, stack.enter_context(path.open("rb")), mime
+        try:
+            # Nonblocking open prevents a FIFO substituted after preflight from hanging.
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise EaselError("Reference files must be regular files")
+                handle = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+        except OSError as exc:
+            raise EaselError(f"Cannot open reference image: {path}: {exc.strerror}") from exc
+        return path.name, stack.enter_context(handle), mime
 
     def image_request(self, operation: str, *, prompt: str | None = None,
                       images: list[Path] | None = None, async_mode: bool = False,
@@ -191,19 +318,88 @@ class EaselClient:
     def create_video(self, prompt: str, *, model: str = VIDEO_MODEL, seconds: int = 4,
                      size: str = "1280x720", input_reference: Path | None = None,
                      camera_lora: str | None = None, camera_lora_strength: float | None = None,
-                     loras: str | None = None, motion_speed: float | None = None,
+                     loras: str | list[LoRASelection] | None = None, motion_speed: float | None = None,
                      seed: int | None = None, lora_reference: Path | None = None,
-                     lora_reference_strength: float | None = None) -> dict[str, Any]:
+                     lora_reference_strength: float | None = None,
+                     guiding_frames: list[GuideFrame] | None = None) -> dict[str, Any]:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise EaselError("prompt is required")
+        if not isinstance(model, str) or not model.strip():
+            raise EaselError("model is required")
+        _integer(seconds, "seconds", 1, 12)
+        if size not in VIDEO_SIZES:
+            raise EaselError("Unsupported video size")
+        if seed is not None:
+            _integer(seed, "seed", 0, 2**64 - 2)
+        selections = _lora_selections(loras)
+        ids = [selection.id for selection in selections]
+        if camera_lora is not None:
+            if not isinstance(camera_lora, str) or camera_lora not in CAMERA_LORAS:
+                raise EaselError("Unknown camera_lora")
+            ids.append("camera-" + camera_lora)
+        if camera_lora_strength is not None:
+            _number(camera_lora_strength, "camera_lora_strength", 0, 2)
+            if camera_lora is None:
+                raise EaselError("camera_lora_strength requires camera_lora")
+        if len(ids) > 4 or len(set(ids)) != len(ids):
+            raise EaselError("Select at most four LoRAs without duplicate ids, including camera_lora")
+        if "ingredients" in ids:
+            if seconds < 5 or lora_reference is None or len(ids) != 1:
+                raise EaselError("ingredients requires lora_reference, at least 5 seconds and no other LoRAs")
+        elif lora_reference is not None or lora_reference_strength is not None:
+            raise EaselError("lora_reference and lora_reference_strength require ingredients")
+        if lora_reference_strength is not None:
+            _number(lora_reference_strength, "lora_reference_strength", 0, 1)
+        if "slow-motion" in ids and motion_speed is None:
+            raise EaselError("slow-motion requires motion_speed")
+        if motion_speed is not None:
+            _number(motion_speed, "motion_speed", 0.025, 1)
+            if "slow-motion" not in ids:
+                raise EaselError("motion_speed requires slow-motion")
+        if {"cinemagraph", "slow-motion"}.intersection(ids) and input_reference is None:
+            raise EaselError("cinemagraph and slow-motion require input_reference")
+        if "cinemagraph" in ids and any(id.startswith("camera-") and id != "camera-static" for id in ids):
+            raise EaselError("cinemagraph conflicts with moving camera LoRAs")
+        guides = []
+        if guiding_frames is not None:
+            if not isinstance(guiding_frames, list) or not 1 <= len(guiding_frames) <= 8:
+                raise EaselError("guiding_frames requires one through eight GuideFrame objects")
+            if input_reference is not None or lora_reference is not None or "ingredients" in ids:
+                raise EaselError("guiding_frames cannot be combined with input_reference or ingredients/lora_reference")
+            for index, guide in enumerate(guiding_frames):
+                if not isinstance(guide, GuideFrame):
+                    raise EaselError("guiding_frames must contain GuideFrame objects")
+                if not isinstance(guide.image, (str, Path)) or not str(guide.image):
+                    raise EaselError("Each guiding frame requires an image path")
+                _integer(guide.frame_index, "frame_index", 0, seconds * 24)
+                strength = _number(guide.strength, "guide strength", 0, 1)
+                guides.append({"image_index": index, "frame_index": guide.frame_index, "strength": strength})
+            if len({guide["frame_index"] for guide in guides}) != len(guides):
+                raise EaselError("guiding_frames must have unique frame indices")
         fields = {"prompt": prompt, "model": model, "seconds": seconds, "size": size,
                   "camera_lora": camera_lora, "camera_lora_strength": camera_lora_strength,
-                  "loras": loras, "motion_speed": motion_speed, "seed": seed,
-                  "lora_reference_strength": lora_reference_strength}
+                  "loras": json.dumps([{"id": item.id, "strength": item.strength} for item in selections],
+                                      separators=(",", ":"), allow_nan=False) if loras is not None else None,
+                  "motion_speed": motion_speed, "seed": seed,
+                  "lora_reference_strength": lora_reference_strength,
+                  "guiding_frames": json.dumps(guides, separators=(",", ":")) if guides else None}
         # Non-file multipart tuples force multipart even for text-to-video requests.
         files = [(name, (None, str(value))) for name, value in fields.items() if value is not None]
         with ExitStack() as stack:
-            for name, path in (("input_reference", input_reference), ("lora_reference", lora_reference)):
+            total = 0
+            references = [("input_reference", input_reference), ("lora_reference", lora_reference)]
+            references.extend(("guiding_images", guide.image) for guide in guiding_frames or [])
+            for name, path in references:
                 if path is not None:
-                    files.append((name, self._upload(stack, path)))
+                    filename, handle, mime = self._upload(stack, path)
+                    remaining = MAX_UPLOAD_BYTES - total
+                    if os.fstat(handle.fileno()).st_size > remaining:
+                        raise EaselError("Combined reference uploads exceed 32 MiB")
+                    content = handle.read(remaining + 1)
+                    total += len(content)
+                    if total > MAX_UPLOAD_BYTES:
+                        raise EaselError("Combined reference uploads exceed 32 MiB")
+                    files.append((name, (filename, content, mime)))
             body = self._submit("/v1/videos", files=files)
         self._validate_receipt(body, "video")
         return body

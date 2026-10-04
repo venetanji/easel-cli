@@ -37,12 +37,12 @@ def test_video_fields_are_multipart_even_without_references():
         body = request.content.decode()
         for name, value in {"model": "ltx-2.5", "prompt": "fox", "seconds": "2", "size": "512x320",
             "seed": "42", "camera_lora": "static", "camera_lora_strength": "0.8",
-            "loras": '[{"id":"camera-static","strength":0.8}]', "motion_speed": "0.2"}.items():
+            "loras": '[{"id":"camera-dolly-in","strength":0.8}]'}.items():
             assert f'name="{name}"\r\n\r\n{value}' in body
         return httpx.Response(200, json={"id": "video_test", "status": "queued"})
     receipt = make_client(handler).create_video("fox", seconds=2, size="512x320", seed=42,
         camera_lora="static", camera_lora_strength=0.8,
-        loras='[{"id":"camera-static","strength":0.8}]', motion_speed=0.2)
+        loras='[{"id":"camera-dolly-in","strength":0.8}]')
     assert receipt["id"] == "video_test"
 
 

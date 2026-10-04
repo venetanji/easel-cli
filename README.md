@@ -57,6 +57,7 @@ or interruption. Existing receipt/output files are never overwritten.
 ## Videos
 
 ```bash
+easel video capabilities
 easel video loras
 easel video create "a red fox walking slowly" --seconds 2 --size 512x320 --seed 42 --receipt fox-video.json
 easel video status VIDEO_ID
@@ -73,12 +74,67 @@ tests. Nominal `1280x720` / `720x1280` currently decode at `1280x704` / `704x128
 At 24 FPS the server produces `seconds * 24 + 1` frames.
 
 Camera flags: `--camera-lora static|dolly-in|dolly-out|dolly-left|dolly-right|jib-up|jib-down`
-and optional `--camera-lora-strength` (0–2). The CLI also passes through the
-server's `--loras` JSON, `--motion-speed`, `--lora-reference` and
-`--lora-reference-strength`. Always inspect `video loras` and the
+and optional `--camera-lora-strength` (finite 0–2, default 0.8). Use repeatable
+`--lora ID[=STRENGTH]` for up to four adapters, including the camera shorthand.
+Adapter strength defaults to 1 and must be finite 0–2. Legacy `--loras` JSON
+is still supported, but cannot be combined with `--lora`. Duplicate IDs,
+paths/URLs, malformed JSON and invalid strengths are rejected before submission.
+Syntactically valid IDs go to the server's curated registry; no custom model
+paths are accepted. Always inspect `video capabilities`, `video loras` and the
 [server's adapter requirements](https://github.com/venetanji/easel/blob/10f118a818615595d53521d0ddae02b9c1d14d27/VIDEO_API.md)
 first. Installed does not mean supported or visually validated. Unsupported
 adapters, missing assets and invalid combinations are rejected by the server.
+
+```bash
+# Slow-motion requires an initial image and motion speed in [0.025, 1].
+easel video create "gentle motion" --input-reference fox.png --lora slow-motion=1 --motion-speed 0.2 --receipt slow-job.json
+# Ingredients uses its own reference sheet, at least five seconds and no other LoRAs.
+easel video create "a forest scene" --seconds 5 --lora ingredients --lora-reference sheet.png --lora-reference-strength 0.8 --receipt ingredients-job.json
+# Guide each still image at an explicit pixel-frame position; frame 48 is valid at two seconds.
+easel video create "one coherent shot" --seconds 2 --size 512x320 --lora camera-static=0.8 --guide-frame 1 "first image.png" 0.7 --guide-frame 48 last.png 0.3 --receipt guided-job.json
+```
+
+`--seed` is an exact Python integer from 0 through 18446744073709551614.
+`cinemagraph` requires `--input-reference` and cannot use moving camera LoRAs.
+`--lora-reference-strength` is finite 0–1, defaults to 1 and requires Ingredients.
+
+### Temporal guiding frames
+
+Repeat `--guide-frame FRAME IMAGE STRENGTH` for one through eight still images.
+Frame positions are unique integers from 0 through `seconds * 24`, inclusive;
+every pixel-frame position is valid (no eight-frame stride). Strength is finite
+0–1. Guides cannot be combined with `--input-reference`, Ingredients or its
+reference-sheet flags. Consequently `cinemagraph` and `slow-motion` cannot be
+used in guide mode. Images must be regular PNG/JPEG/WebP files; all video
+reference files together are capped at 32 MiB before POST. The server verifies
+that guide images are decodable still images; animated PNG/WebP is rejected.
+
+`video capabilities` is a GET-only, versioned discovery response. It exposes
+limits and distinguishes guide `supported` code, live node `available` state,
+and `validation`. Temporal guides are `graph_contract_tested`, not GPU-execution
+or visual-quality validated. An older server without this endpoint fails
+explicitly. Basic creation does not require a discovery request, and advanced
+options are never silently dropped.
+
+Python callers can use typed inputs:
+
+```python
+from pathlib import Path
+from easel_cli.client import EaselClient, GuideFrame, LoRASelection
+
+with EaselClient(base_url, api_key) as client:
+    capabilities = client.video_capabilities()
+    receipt = client.create_video(
+        "one coherent shot", seconds=2, size="512x320", seed=42,
+        loras=[LoRASelection("camera-static", 0.8)],
+        guiding_frames=[GuideFrame(Path("first.png"), 1, 0.7),
+                        GuideFrame(Path("last.png"), 48)],
+    )
+    print(receipt["id"])  # Save this before polling. Do not resubmit on timeout.
+```
+
+The client serializes guides as `guiding_frames` JSON metadata referencing
+ordered `guiding_images` multipart uploads. Local paths never enter metadata.
 
 ## Safety and recovery
 
@@ -124,7 +180,9 @@ uv run easel video create --help
 The normal suite is entirely offline. An additional in-process contract suite
 runs the actual Easel FastAPI app against fake ComfyUI backends, covering model
 and LoRA discovery, synchronous images, async generation/edit/variation in both
-response formats, T2V/I2V queue/status/content, and retired-model errors.
+response formats, T2V/I2V queue/status/content, typed guides and LoRAs through
+both graph passes, capability availability, uint64 seed boundaries, unsupported
+adapter errors and missing guide nodes before uploads.
 It requires a separate Easel checkout with its dev dependencies installed:
 
 ```bash
@@ -133,10 +191,12 @@ EASEL_SERVER_SOURCE=/path/to/easel PYTHONPATH=src \
   /path/to/easel/.venv/bin/python -m pytest -q contract/server_contract.py
 ```
 
-Contract audited against Easel
+The baseline image/video job contract was audited against Easel
 [`10f118a`](https://github.com/venetanji/easel/commit/10f118a818615595d53521d0ddae02b9c1d14d27).
 See the pinned [image-job contract](https://github.com/venetanji/easel/blob/10f118a818615595d53521d0ddae02b9c1d14d27/IMAGE_JOBS.md)
 and [model-serving contract](https://github.com/venetanji/easel/blob/10f118a818615595d53521d0ddae02b9c1d14d27/MODEL_SERVING.md).
+The expanded contract suite requires an Easel checkout with video capabilities
+schema version 1 and temporal guiding-frame support.
 These checks prove protocol compatibility with fake output bytes; they do not
 prove GPU execution, actual MP4 validity, visual quality or timeline rendering.
 

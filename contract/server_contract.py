@@ -16,7 +16,7 @@ if not SERVER_SOURCE:
     pytest.skip("Set EASEL_SERVER_SOURCE to an Easel checkout", allow_module_level=True)
 sys.path.insert(0, str(Path(SERVER_SOURCE).resolve()))
 
-from easel_cli.client import EaselClient, EaselError
+from easel_cli.client import EaselClient, EaselError, GuideFrame, LoRASelection
 
 
 class Backend:
@@ -25,6 +25,8 @@ class Backend:
         self.submissions = []
         self.finished = False
         self.uploads = []
+        self.installed_loras = []
+        self.guides_available = False
 
     async def submit(self, graph):
         self.submissions.append(graph)
@@ -55,7 +57,18 @@ class Backend:
         return "reference.png", ""
 
     async def object_info(self, name):
-        return {name: {"input": {"required": {"lora_name": [[]]}}}}
+        if name == "LoraLoaderModelOnly":
+            return {name: {"input": {"required": {"lora_name": [self.installed_loras]}}}}
+        keys = {"LTXVAddGuide": ["positive", "negative", "vae", "latent", "image", "frame_idx", "strength"],
+                "LTXVCropGuides": ["positive", "negative", "latent"]}.get(name)
+        if keys and self.guides_available:
+            schema = {"positive": ["CONDITIONING"], "negative": ["CONDITIONING"],
+                      "vae": ["VAE"], "latent": ["LATENT"], "image": ["IMAGE"],
+                      "frame_idx": ["INT", {"default": 0, "min": -9999, "max": 9999, "step": 1}],
+                      "strength": ["FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}]}
+            return {name: {"input": {"required": {key: schema[key] for key in keys}},
+                           "output": ["CONDITIONING", "CONDITIONING", "LATENT"]}}
+        return {}
 
 
 @pytest.fixture
@@ -132,3 +145,65 @@ def test_retired_model_fails_before_backend_submission(api):
     assert error.value.status_code == 400
     assert error.value.code == "model_not_found"
     assert image.submissions == []
+
+
+def test_capabilities_distinguishes_support_from_available_nodes(api):
+    client, _, video = api
+    capabilities = client.video_capabilities()
+    assert capabilities["schema_version"] == 1
+    assert capabilities["guiding_frames"]["supported"] is True
+    assert capabilities["guiding_frames"]["available"] is False
+    assert capabilities["guiding_frames"]["validation"] == "graph_contract_tested"
+    assert capabilities["seed"]["max"] == "18446744073709551614"
+    assert capabilities["uploads"]["max_total_bytes"] == 33554432
+    video.guides_available = True
+    assert client.video_capabilities()["guiding_frames"]["available"] is True
+    assert video.submissions == [] and video.uploads == []
+
+
+def test_guiding_frames_typed_lora_and_exact_seed_reach_both_graph_passes(api, tmp_path):
+    from PIL import Image
+    from easel.video_loras import VIDEO_LORAS
+    client, _, video = api
+    video.guides_available = True
+    video.installed_loras = [VIDEO_LORAS["camera-static"]["files"][0]["filename"]]
+    first, last = tmp_path / "first.png", tmp_path / "last.png"
+    Image.new("RGB", (8, 8), "red").save(first)
+    Image.new("RGB", (8, 8), "blue").save(last)
+    receipt = client.create_video("one coherent shot", seconds=2, size="512x320", seed=2**64-2,
+        loras=[LoRASelection("camera-static", 0.8)],
+        guiding_frames=[GuideFrame(first, 1, 0.7), GuideFrame(last, 48, 0.3)])
+    assert receipt["id"].startswith("video_")
+    assert len(video.submissions) == 1 and len(video.uploads) == 2
+    graph = video.submissions[0]
+    guides = [node["inputs"] for node in graph.values() if node["class_type"] == "LTXVAddGuide"]
+    assert [node["frame_idx"] for node in guides] == [1, 48, 1, 48]
+    assert [node["strength"] for node in guides] == [0.7, 0.3, 0.7, 0.3]
+    assert [node["inputs"]["noise_seed"] for node in graph.values()
+            if node["class_type"] == "RandomNoise"] == [2**64-2, 2**64-1]
+    video.finished = True
+    assert client.wait_for_job("video", receipt["id"], timeout=2)["status"] == "completed"
+    assert client.download_video(receipt["id"]) == b"FAKE-MP4"
+    assert len(video.submissions) == 1
+
+
+def test_guide_missing_nodes_rejects_before_upload(api, tmp_path):
+    from PIL import Image
+    client, _, video = api
+    image = tmp_path / "guide.png"
+    Image.new("RGB", (8, 8), "red").save(image)
+    with pytest.raises(EaselError) as error:
+        client.create_video("fox", guiding_frames=[GuideFrame(image, 0)])
+    assert error.value.status_code == 503
+    assert video.uploads == [] and video.submissions == []
+
+
+@pytest.mark.parametrize("id", ["clean-plate", "unknown-future-adapter"])
+def test_registry_rejects_unsupported_and_unknown_ids_before_upload(api, tmp_path, id):
+    client, _, video = api
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    with pytest.raises(EaselError) as error:
+        client.create_video("fox", loras=[LoRASelection(id)], input_reference=image)
+    assert error.value.status_code == 400
+    assert video.uploads == [] and video.submissions == []

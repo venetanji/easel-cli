@@ -153,3 +153,44 @@ def test_image_receipt_cannot_collide_with_numbered_or_normalized_output(api, fl
     calls, _ = api
     assert cli.main(["generate", "fox", "--wait", *flags]) == 1
     assert not calls
+
+
+def test_video_capabilities_is_read_only_and_preserves_validation(api, capsys):
+    calls, responses = api
+    body = {"object": "video.capabilities", "schema_version": 1, "model": "ltx-2.5",
+        "guiding_frames": {"supported": True, "available": False, "validation": "graph_contract_tested"}}
+    responses.append(httpx.Response(200, json=body))
+    assert cli.main(["video", "capabilities"]) == 0
+    assert json.loads(capsys.readouterr().out) == body
+    assert [(r.method, r.url.path) for r in calls] == [("GET", "/v1/videos/capabilities")]
+
+
+def test_typed_cli_controls_preserve_submit_once_receipt(api, tmp_path, capsys):
+    calls, responses = api
+    image = tmp_path / "guide with spaces.png"
+    image.write_bytes(b"image")
+    responses.append(httpx.Response(200, json={"id": "video_test", "status": "queued"}))
+    assert cli.main(["video", "create", "fox", "--seed", "18446744073709551614",
+        "--lora", "camera-static=0.8", "--guide-frame", "1", str(image), "0.5",
+        "--guide-frame", "96", str(image), "1", "--receipt", "receipt.json"]) == 0
+    assert json.loads(capsys.readouterr().out)["id"] == "video_test"
+    assert json.loads((tmp_path / "receipt.json").read_text())["id"] == "video_test"
+    assert len(calls) == 1 and calls[0].method == "POST"
+    assert b'name="guiding_frames"' in calls[0].content
+    assert b'"frame_index":1' in calls[0].content
+    assert b'"id":"camera-static"' in calls[0].content
+
+
+@pytest.mark.parametrize("flags", [
+    ["--lora", "camera-static", "--loras", "[]"], ["--lora", "camera-static=nope"],
+    ["--lora", "../model"], ["--guide-frame", "nope", "image.png", "1"],
+    ["--guide-frame", "0", "image.png", "NaN"], ["--seed", "18446744073709551615"],
+    ["--camera-lora-strength", "nan"], ["--loras", "["],
+])
+def test_invalid_advanced_cli_controls_do_not_submit(api, flags):
+    calls, _ = api
+    try:
+        assert cli.main(["video", "create", "fox", *flags]) == 1
+    except SystemExit as exc:
+        assert exc.code == 2
+    assert calls == []

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import httpx
 
-from easel_cli.client import EaselClient, EaselError, IMAGE_MODEL, VIDEO_MODEL
+from easel_cli.client import (EaselClient, EaselError, GuideFrame, LoRASelection,
+                              IMAGE_MODEL, VIDEO_MODEL, VIDEO_SIZES)
 
 DEFAULT_BASE_URL = "https://easel.ait4x.org"
 
@@ -56,6 +57,23 @@ def positive_number(value: str) -> float:
     return number
 
 
+def lora_selection(value: str) -> LoRASelection:
+    identity, separator, strength = value.partition("=")
+    try:
+        return LoRASelection(identity, float(strength) if separator else 1.0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("LoRA selection must be ID or ID=STRENGTH") from exc
+
+
+def guide_frames(values: list[list[str]] | None) -> list[GuideFrame] | None:
+    if values is None:
+        return None
+    try:
+        return [GuideFrame(Path(image), int(frame), float(strength)) for frame, image, strength in values]
+    except ValueError as exc:
+        raise EaselError("--guide-frame requires integer FRAME, IMAGE path and numeric STRENGTH") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="easel", description="Generate images and videos with Easel")
     parser.add_argument("--version", action="version", version="easel-cli 0.1.0")
@@ -96,12 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("prompt")
     create.add_argument("--model", default=VIDEO_MODEL)
     create.add_argument("--seconds", type=int, choices=range(1, 13), default=4)
-    create.add_argument("--size", default="1280x720", choices=("512x320", "640x384", "768x512", "1280x720", "720x1280", "1792x1024", "1024x1792"))
+    create.add_argument("--size", default="1280x720", choices=VIDEO_SIZES)
     create.add_argument("--input-reference", type=Path)
     create.add_argument("--seed", type=int)
     create.add_argument("--camera-lora", choices=("dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static"))
     create.add_argument("--camera-lora-strength", type=float)
-    create.add_argument("--loras", help="JSON array of registered id/strength selections; consult video loras")
+    selections = create.add_mutually_exclusive_group()
+    selections.add_argument("--lora", action="append", type=lora_selection,
+                            help="registered ID or ID=STRENGTH; repeat up to four times")
+    selections.add_argument("--loras", help="legacy JSON array of registered id/strength selections; consult video loras")
+    create.add_argument("--guide-frame", action="append", nargs=3, metavar=("FRAME", "IMAGE", "STRENGTH"),
+                        help="guide at a pixel-frame index (0 through seconds*24); repeat up to eight times")
     create.add_argument("--motion-speed", type=float)
     create.add_argument("--lora-reference", type=Path)
     create.add_argument("--lora-reference-strength", type=float)
@@ -115,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_connection_options(queue)
     loras = actions.add_parser("loras", help="discover supported/installed adapter capabilities as JSON")
     _add_connection_options(loras)
+    capabilities = actions.add_parser("capabilities", help="discover video limits and guide support/availability as JSON")
+    _add_connection_options(capabilities)
     return parser
 
 
@@ -215,6 +240,9 @@ def _run(client, args, api_key: str) -> None:
             print(model.replace(api_key, "[REDACTED]"))
         return
     if args.command == "video":
+        if args.action == "capabilities":
+            _print_json(client.video_capabilities(), api_key)
+            return
         if args.action == "loras":
             _print_json(client.list_loras(), api_key)
             return
@@ -226,9 +254,10 @@ def _run(client, args, api_key: str) -> None:
                 _check_new(args.receipt)
             if args.wait:
                 _check_new(args.output)
-            body = client.create_video(args.prompt, **{name: getattr(args, name) for name in (
+            body = client.create_video(args.prompt, loras=args.lora if args.lora is not None else args.loras,
+                guiding_frames=guide_frames(args.guide_frame), **{name: getattr(args, name) for name in (
                 "model", "seconds", "size", "input_reference", "seed", "camera_lora", "camera_lora_strength",
-                "loras", "motion_speed", "lora_reference", "lora_reference_strength")})
+                "motion_speed", "lora_reference", "lora_reference_strength")})
             _receipt(body, args.receipt, api_key)
             if not args.wait:
                 return
