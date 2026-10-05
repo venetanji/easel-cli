@@ -51,4 +51,15 @@ uv run easel --help
 
 ## License
 
-MIT
+Project-maintained code, tests, documentation, and configuration are offered under
+the GNU General Public License, version 3 or later (`GPL-3.0-or-later`). See the
+full [LICENSE](LICENSE) and the grant and scope in [NOTICE](NOTICE).
+
+The original MIT copyright and permission notice is preserved in
+[LICENSES/legacy-MIT.txt](LICENSES/legacy-MIT.txt). Existing MIT grants for that
+material are not revoked by this change.
+
+Third-party dependencies, the remote Easel service, ComfyUI, and model weights
+retain their own licenses and terms. This project's license does not automatically
+apply to generated images. See [the licensing audit](docs/license-audit.md) for
+the reviewed scope, evidence, and distribution checks.
