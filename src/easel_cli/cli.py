@@ -104,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     models = commands.add_parser("models", help="discover current image and video model IDs")
     _add_connection_options(models)
 
+    guide = commands.add_parser("model-guide", help="read shared model/mode prompt guidance as reference JSON")
+    guide.add_argument("model")
+    guide.add_argument("--mode", required=True)
+    _add_connection_options(guide)
+
     jobs = commands.add_parser("image-job", help="retrieve accepted image jobs without resubmitting")
     actions = jobs.add_subparsers(dest="action", required=True)
     _add_job_commands(actions, "easel.png")
@@ -235,6 +240,9 @@ def _run(client, args, api_key: str) -> None:
     if getattr(args, "receipt", None) and getattr(args, "wait", False):
         if args.receipt.resolve() == args.output.resolve():
             raise EaselError("Receipt and media output must use different filenames")
+    if args.command == "model-guide":
+        _print_json(client.get_model_guide(args.model, args.mode), api_key)
+        return
     if args.command == "models":
         for model in client.list_models():
             print(model.replace(api_key, "[REDACTED]"))

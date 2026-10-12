@@ -229,6 +229,22 @@ class EaselClient:
                                  "The server has no receipt-recovery endpoint.") from exc
             raise
 
+    def get_model_guide(self, model: str, mode: str) -> dict[str, Any]:
+        """Read reference content from the configured API; never execute guide text."""
+        for name, value in (("model", model), ("mode", mode)):
+            if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", value):
+                raise EaselError(f"Invalid guide {name}")
+        with self._http.stream("GET", f"{self.base_url}/v1/models/{model}/guide",
+                               params={"mode": mode}, headers=self._headers,
+                               follow_redirects=False, timeout=self.timeout) as response:
+            content = bytearray()
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if len(content) > 16 * 1024:
+                    raise EaselError("Model guide exceeds 16 KiB")
+            return self._decode_response(httpx.Response(response.status_code,
+                headers=response.headers, content=bytes(content)))
+
     def list_models(self) -> list[str]:
         body = self._get_json("/v1/models")
         try:
