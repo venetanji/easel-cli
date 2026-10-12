@@ -121,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--seconds", type=int, choices=range(1, 13), default=4)
     create.add_argument("--size", default="1280x720", choices=VIDEO_SIZES)
     create.add_argument("--input-reference", type=Path)
+    create.add_argument("--source-audio", type=Path, help="WAV/MP3/FLAC/Ogg/M4A; conditions video and supplies its trimmed soundtrack")
     create.add_argument("--seed", type=int)
     create.add_argument("--camera-lora", choices=("dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static"))
     create.add_argument("--camera-lora-strength", type=float)
@@ -264,7 +265,7 @@ def _run(client, args, api_key: str) -> None:
                 _check_new(args.output)
             body = client.create_video(args.prompt, loras=args.lora if args.lora is not None else args.loras,
                 guiding_frames=guide_frames(args.guide_frame), **{name: getattr(args, name) for name in (
-                "model", "seconds", "size", "input_reference", "seed", "camera_lora", "camera_lora_strength",
+                "model", "seconds", "size", "input_reference", "source_audio", "seed", "camera_lora", "camera_lora_strength",
                 "motion_speed", "lora_reference", "lora_reference_strength")})
             _receipt(body, args.receipt, api_key)
             if not args.wait:

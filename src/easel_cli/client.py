@@ -23,6 +23,10 @@ VIDEO_MODEL = "ltx-2.5"
 JOB_STATUSES = {"queued", "in_progress", "completed", "failed", "cancelled"}
 VIDEO_SIZES = ("512x320", "640x384", "768x512", "1280x720", "720x1280", "1792x1024", "1024x1792")
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+MAX_AUDIO_BYTES = 32 * 1024 * 1024
+# Canonical MIME for each supported file extension; server validates actual bytes.
+AUDIO_FILE_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac",
+                    ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
 CAMERA_LORAS = ("dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static")
 
 
@@ -268,31 +272,38 @@ class EaselClient:
                 raise EaselError("Easel API returned an invalid LoRA catalog")
         return cast(list[LoRACatalogEntry], data)
 
-    def video_capabilities(self) -> VideoCapabilities:
-        body = self._get_json("/v1/videos/capabilities")
+    def video_capabilities(self, model: str | None = None) -> VideoCapabilities:
+        if model is None:
+            body = self._get_json("/v1/videos/capabilities")
+        else:
+            body = self._decode_response(self._http.get(
+                f"{self.base_url}/v1/videos/capabilities", params={"model": model},
+                headers=self._headers, follow_redirects=False, timeout=self.timeout))
         if (body.get("object") != "video.capabilities" or type(body.get("schema_version")) is not int
                 or body["schema_version"] != 1):
             raise EaselError("Easel API returned an unsupported video capabilities contract")
         return cast(VideoCapabilities, body)
 
     @staticmethod
-    def _upload(stack: ExitStack, path: Path) -> tuple[str, Any, str]:
+    def _upload(stack: ExitStack, path: Path, *, audio: bool = False) -> tuple[str, Any, str]:
         path = Path(path)
-        mime = mimetypes.guess_type(path.name)[0]
-        if mime not in {"image/png", "image/jpeg", "image/webp"}:
+        mime = AUDIO_FILE_TYPES.get(path.suffix.lower()) if audio else mimetypes.guess_type(path.name)[0]
+        if audio and mime is None:
+            raise EaselError("source_audio files must be WAV, MP3, FLAC, Ogg or M4A")
+        if not audio and mime not in {"image/png", "image/jpeg", "image/webp"}:
             raise EaselError("Reference files must be PNG, JPEG or WebP")
         try:
             # Nonblocking open prevents a FIFO substituted after preflight from hanging.
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
             try:
                 if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise EaselError("Reference files must be regular files")
+                    raise EaselError("source_audio files must be regular files" if audio else "Reference files must be regular files")
                 handle = os.fdopen(descriptor, "rb")
             except BaseException:
                 os.close(descriptor)
                 raise
         except OSError as exc:
-            raise EaselError(f"Cannot open reference image: {path}: {exc.strerror}") from exc
+            raise EaselError(f"Cannot open {'source_audio' if audio else 'reference image'}: {path}: {exc.strerror}") from exc
         return path.name, stack.enter_context(handle), mime
 
     def image_request(self, operation: str, *, prompt: str | None = None,
@@ -337,7 +348,8 @@ class EaselClient:
                      loras: str | list[LoRASelection] | None = None, motion_speed: float | None = None,
                      seed: int | None = None, lora_reference: Path | None = None,
                      lora_reference_strength: float | None = None,
-                     guiding_frames: list[GuideFrame] | None = None) -> dict[str, Any]:
+                     guiding_frames: list[GuideFrame] | None = None,
+                     source_audio: Path | None = None) -> dict[str, Any]:
         if not isinstance(prompt, str) or not prompt.strip():
             raise EaselError("prompt is required")
         if not isinstance(model, str) or not model.strip():
@@ -392,6 +404,12 @@ class EaselClient:
                 guides.append({"image_index": index, "frame_index": guide.frame_index, "strength": strength})
             if len({guide["frame_index"] for guide in guides}) != len(guides):
                 raise EaselError("guiding_frames must have unique frame indices")
+        if source_audio is not None:
+            capability = self.video_capabilities(model)
+            audio_capability = capability.get("source_audio")
+            if (capability.get("model") != model or not isinstance(audio_capability, dict)
+                    or audio_capability.get("available") is not True):
+                raise EaselError("source_audio is unavailable for the selected model; check current video capabilities")
         fields = {"prompt": prompt, "model": model, "seconds": seconds, "size": size,
                   "camera_lora": camera_lora, "camera_lora_strength": camera_lora_strength,
                   "loras": json.dumps([{"id": item.id, "strength": item.strength} for item in selections],
@@ -416,6 +434,14 @@ class EaselClient:
                     if total > MAX_UPLOAD_BYTES:
                         raise EaselError("Combined reference uploads exceed 32 MiB")
                     files.append((name, (filename, content, mime)))
+            if source_audio is not None:
+                filename, handle, mime = self._upload(stack, source_audio, audio=True)
+                if os.fstat(handle.fileno()).st_size > MAX_AUDIO_BYTES:
+                    raise EaselError("source_audio exceeds 32 MiB")
+                content = handle.read(MAX_AUDIO_BYTES + 1)
+                if not content or len(content) > MAX_AUDIO_BYTES:
+                    raise EaselError("source_audio must be nonempty and at most 32 MiB")
+                files.append(("source_audio", (filename, content, mime)))
             body = self._submit("/v1/videos", files=files)
         self._validate_receipt(body, "video")
         return body
@@ -423,7 +449,9 @@ class EaselClient:
     @staticmethod
     def _job_path(kind: str, job_id: str) -> str:
         prefix = {"image": "image_job_", "video": "video_"}.get(kind)
-        if prefix is None or not isinstance(job_id, str) or not job_id.startswith(prefix) or not re.fullmatch(r"[A-Za-z0-9_.-]+", job_id):
+        # Current video receipts include colon-separated timing metadata.
+        pattern = r"[A-Za-z0-9_.:-]+" if kind == "video" else r"[A-Za-z0-9_.-]+"
+        if prefix is None or not isinstance(job_id, str) or not job_id.startswith(prefix) or not re.fullmatch(pattern, job_id):
             raise EaselError("Invalid job ID or job kind")
         return f"/v1/images/jobs/{job_id}" if kind == "image" else f"/v1/videos/{job_id}"
 
