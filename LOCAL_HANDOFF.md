@@ -47,3 +47,20 @@ recipe needs 124/24 seconds and must omit seconds. Source audio conditions motio
 and supplies the trimmed soundtrack; mention visible articulation and pauses.
 Do not translate H3 frames into this CLI's seconds argument or assume perfect
 lip-sync. Check current exact-model source_audio availability before supplying it.
+
+
+### Pinned offline contract CI
+
+The existing CI workflow now runs the consumer's production adapter against
+server commit `4c114e5642c7db875ffafb3ae3c70a21183032ad` with fake backends and installed ffmpeg/ffprobe.
+The client job builds Media MCP before running the server's MCP contract suite;
+the CLI job runs its local `contract/server_contract.py` with the server's dev
+dependencies. An absent or invalid configured checkout fails the job.
+
+The cross-repository checkout uses only the existing GitHub token. A private
+`venetanji/easel` checkout may be inaccessible to that repository-scoped token;
+this access boundary has not been verified on GitHub. If checkout fails, CI
+fails visibly: no skip, alternate unpinned source, or new secret is added.
+Local contract verification with all three checkouts succeeds independently
+of hosted checkout access. These are protocol and graph tests, not GPU or
+visual lip-sync verification.
