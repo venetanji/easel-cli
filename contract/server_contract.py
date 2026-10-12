@@ -4,6 +4,10 @@ Run with that checkout's dev Python, EASEL_SERVER_SOURCE and this repo's src on
 PYTHONPATH. All backends are fake; no network or model execution occurs.
 """
 import dataclasses
+import io
+import wave
+
+import httpx
 import os
 import sys
 import time
@@ -13,7 +17,9 @@ import pytest
 
 SERVER_SOURCE = os.environ.get("EASEL_SERVER_SOURCE")
 if not SERVER_SOURCE:
-    pytest.skip("Set EASEL_SERVER_SOURCE to an Easel checkout", allow_module_level=True)
+    raise RuntimeError("Set EASEL_SERVER_SOURCE to an existing Easel checkout")
+if not (Path(SERVER_SOURCE) / "easel" / "app.py").is_file():
+    raise RuntimeError("EASEL_SERVER_SOURCE must contain easel/app.py")
 sys.path.insert(0, str(Path(SERVER_SOURCE).resolve()))
 
 from easel_cli.client import EaselClient, EaselError, GuideFrame, LoRASelection
@@ -27,6 +33,7 @@ class Backend:
         self.uploads = []
         self.installed_loras = []
         self.guides_available = False
+        self.audio_available = False
 
     async def submit(self, graph):
         self.submissions.append(graph)
@@ -54,9 +61,11 @@ class Backend:
 
     async def upload_image(self, data, filename, content_type=None):
         self.uploads.append((data, filename, content_type))
-        return "reference.png", ""
+        return (filename if content_type == "audio/wav" else "reference.png"), ""
 
     async def object_info(self, name):
+        if self.audio_available and name in AUDIO_SCHEMAS:
+            return {name: AUDIO_SCHEMAS[name]}
         if name == "LoraLoaderModelOnly":
             return {name: {"input": {"required": {"lora_name": [self.installed_loras]}}}}
         keys = {"LTXVAddGuide": ["positive", "negative", "vae", "latent", "image", "frame_idx", "strength"],
@@ -88,7 +97,7 @@ def api(tmp_path, monkeypatch):
 
 def test_current_model_and_adapter_discovery(api):
     client, _, _ = api
-    assert client.list_models() == ["qwen-image-2.1", "ltx-2.5"]
+    assert client.list_models() == ["qwen-image-2.1", "ltx-2.5", "minimax-h3"]
     catalog = client.list_loras()
     assert any(item["id"] == "ingredients" for item in catalog)
     assert all("supported" in item and item["installed"] is False for item in catalog)
@@ -207,3 +216,128 @@ def test_registry_rejects_unsupported_and_unknown_ids_before_upload(api, tmp_pat
         client.create_video("fox", loras=[LoRASelection(id)], input_reference=image)
     assert error.value.status_code == 400
     assert video.uploads == [] and video.submissions == []
+
+
+AUDIO_SCHEMAS = {
+    'LoadAudio': {'input': {'required': {'audio': [[], {'audio_upload': True}]}}, 'output': ['AUDIO']},
+    'TrimAudioDuration': {'input': {'required': {'audio': ['AUDIO'], 'start_index': ['FLOAT'],
+                                              'duration': ['FLOAT']}}, 'output': ['AUDIO']},
+    'LTXVAudioVAEEncode': {'input': {'required': {'audio': ['AUDIO'], 'audio_vae': ['VAE']}}, 'output': ['LATENT']},
+    'SolidMask': {'input': {'required': {'value': ['FLOAT'], 'width': ['INT'], 'height': ['INT']}}, 'output': ['MASK']},
+    'SetLatentNoiseMask': {'input': {'required': {'samples': ['LATENT'], 'mask': ['MASK']}}, 'output': ['LATENT']},
+}
+
+
+def audio_file(tmp_path, seconds):
+    path = tmp_path / 'speech.wav'
+    with wave.open(str(path), 'wb') as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(24_000)
+        audio.writeframes(b'\0\0' * round(seconds * 24_000))
+    return path
+
+
+@pytest.mark.parametrize('model,mode', [('qwen-image-2.1', 'generation'),
+    ('qwen-image-2.1', 'editing'), ('minimax-h3', 'base'), ('minimax-h3', 'reference')])
+def test_model_guide_identity(api, model, mode):
+    from easel.model_guides import get_model_guide
+    client, image, video = api
+    assert client.get_model_guide(model, mode) == get_model_guide(model, mode)
+    assert image.submissions == video.submissions == []
+
+
+def test_unavailable_model_guide(api):
+    client, _, _ = api
+    with pytest.raises(EaselError) as error:
+        client.get_model_guide('ltx-2.5', 'base')
+    assert error.value.code == 'model_guide_unavailable'
+
+
+def test_audio_policy_matches_server(api):
+    from easel.source_audio import AUDIO_MIME_TYPES, MAX_AUDIO_BYTES, audio_tools_available
+    from easel_cli.client import AUDIO_FILE_TYPES, MAX_AUDIO_BYTES as CLI_AUDIO_BYTES
+    assert audio_tools_available(), 'ffmpeg and ffprobe required for source-audio contract'
+    client, _, video = api
+    video.audio_available = True
+    cap = client.video_capabilities('ltx-2.5')['source_audio']
+    assert cap['field'] == 'source_audio'
+    assert cap['max_bytes'] == MAX_AUDIO_BYTES == CLI_AUDIO_BYTES
+    assert cap['mime_types'] == list(AUDIO_MIME_TYPES)
+    assert set(AUDIO_FILE_TYPES.values()) <= set(AUDIO_MIME_TYPES)
+    assert cap['available'] is True
+
+
+@pytest.mark.parametrize('reference', [False, True])
+def test_source_audio_conditioning_and_mux(api, tmp_path, reference):
+    from PIL import Image
+    client, _, video = api
+    video.audio_available = True
+    audio = audio_file(tmp_path, 2)
+    image = tmp_path / 'first.png'
+    Image.new('RGB', (8, 8), 'red').save(image)
+    receipt = client.create_video('visible articulation and pauses', seconds=1, size='512x320',
+        source_audio=audio, input_reference=image if reference else None)
+    assert receipt['frames'] == 25
+    assert len(video.submissions) == 1
+    graph = video.submissions[0]
+    nodes = lambda kind: [(key, node['inputs']) for key, node in graph.items() if node['class_type'] == kind]
+    trim_key, trim = nodes('TrimAudioDuration')[0]
+    assert trim['duration'] == 25/24 and trim['start_index'] == 0
+    assert nodes('CreateVideo')[0][1]['audio'] == [trim_key, 0]
+    assert not nodes('LTXVAudioVAEDecode')
+    uploaded, filename, mime = next(item for item in video.uploads if item[2] == 'audio/wav')
+    assert nodes('LoadAudio')[0][1]['audio'] == filename
+    with wave.open(io.BytesIO(uploaded), 'rb') as decoded:
+        assert (decoded.getframerate(), decoded.getnchannels(), decoded.getnframes()) == (48_000, 2, 50_000)
+
+
+def test_short_audio_rejected_before_upload(api, tmp_path):
+    client, _, video = api
+    video.audio_available = True
+    with pytest.raises(EaselError) as error:
+        client.create_video('speaking', seconds=1, source_audio=audio_file(tmp_path, 1))
+    assert error.value.code == 'audio_too_short'
+    assert video.uploads == video.submissions == []
+
+
+def test_unavailable_audio_blocks_only_new_argument(api, tmp_path):
+    client, _, video = api
+    with pytest.raises(EaselError, match='source_audio'):
+        client.create_video('speaking', source_audio=audio_file(tmp_path, 2))
+    assert video.uploads == video.submissions == []
+    client.create_video('speaking', seconds=1)
+    assert len(video.submissions) == 1
+
+
+def test_old_capabilities_blocks_only_new_argument(api, tmp_path, monkeypatch):
+    client, _, video = api
+    original = client._http.get
+    def old_get(*args, **kwargs):
+        response = original(*args, **kwargs)
+        body = response.json()
+        body.pop('source_audio', None)
+        return httpx.Response(response.status_code, json=body)
+    monkeypatch.setattr(client._http, 'get', old_get)
+    with pytest.raises(EaselError, match='source_audio'):
+        client.create_video('speaking', source_audio=audio_file(tmp_path, 2))
+    assert video.uploads == video.submissions == []
+    client.create_video('speaking', seconds=1)
+    assert len(video.submissions) == 1
+
+
+def test_lost_audio_receipt_never_double_posts(api, tmp_path, monkeypatch):
+    client, _, video = api
+    video.audio_available = True
+    original = client._http.post
+    posts = []
+    def lose_receipt(*args, **kwargs):
+        posts.append(args[0])
+        response = original(*args, **kwargs)
+        assert response.is_success
+        raise httpx.ReadError('receipt lost after acceptance')
+    monkeypatch.setattr(client._http, 'post', lose_receipt)
+    with pytest.raises(EaselError, match='ambiguous'):
+        client.create_video('speaking', seconds=1, source_audio=audio_file(tmp_path, 2))
+    assert posts == ['https://easel.test/v1/videos']
+    assert len(video.submissions) == 1

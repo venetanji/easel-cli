@@ -32,3 +32,25 @@ def test_invalid_route_never_requests(model, mode):
     client = EaselClient('https://easel.test', 'key', http_client=httpx.Client(transport=httpx.MockTransport(lambda r: pytest.fail('unexpected request'))))
     with pytest.raises(EaselError):
         client.get_model_guide(model, mode)
+
+
+def test_cli_guide_dispatch_and_sources(monkeypatch, capsys):
+    from easel_cli import cli
+    payload={'model':'minimax-h3','mode':'base','sources':['https://source.test'],'text':'reference'}
+    def client(*args, **kwargs):
+        return EaselClient(*args, **kwargs, http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200,json=payload))))
+    monkeypatch.setattr(cli,'EaselClient',client)
+    monkeypatch.setenv('EASEL_API_KEY','test-key')
+    assert cli.main(['model-guide','minimax-h3','--mode','base','--base-url','https://easel.test'])==0
+    import json
+    assert json.loads(capsys.readouterr().out)==payload
+
+
+def test_bounded_stream_does_not_read_remainder():
+    class Chunks(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'x' * (16 * 1024 + 1)
+            pytest.fail('read beyond guide limit')
+    http=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200,stream=Chunks())))
+    client=EaselClient('https://easel.test','key',http_client=http)
+    with pytest.raises(EaselError,match='16 KiB'):client.get_model_guide('minimax-h3','base')
