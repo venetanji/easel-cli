@@ -246,8 +246,12 @@ class EaselClient:
                 content.extend(chunk)
                 if len(content) > 16 * 1024:
                     raise EaselError("Model guide exceeds 16 KiB")
+            # iter_bytes already decoded Content-Encoding; do not decode it twice
+            # or carry the compressed body's stale Content-Length into the copy.
+            headers = {name: value for name, value in response.headers.items()
+                       if name not in {"content-encoding", "content-length"}}
             return self._decode_response(httpx.Response(response.status_code,
-                headers=response.headers, content=bytes(content)))
+                headers=headers, content=bytes(content)))
 
     def list_models(self) -> list[str]:
         body = self._get_json("/v1/models")

@@ -54,3 +54,38 @@ def test_bounded_stream_does_not_read_remainder():
     http=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200,stream=Chunks())))
     client=EaselClient('https://easel.test','key',http_client=http)
     with pytest.raises(EaselError,match='16 KiB'):client.get_model_guide('minimax-h3','base')
+
+
+@pytest.mark.parametrize('case', ['success', 'oversize', 'unavailable'])
+def test_gzip_guide_decoded_once_and_bounded(case):
+    import gzip
+    import json
+    payload = {'model': 'minimax-h3', 'mode': 'base', 'text': 'reference',
+               'sources': ['https://source.test']}
+    status = 200
+    if case == 'oversize':
+        payload['text'] = 'x' * (16 * 1024)
+    elif case == 'unavailable':
+        status = 404
+        payload = {'error': {'message': 'No reviewed guide',
+                             'code': 'model_guide_unavailable', 'param': 'mode'}}
+    compressed = gzip.compress(json.dumps(payload).encode())
+    def handler(request):
+        return httpx.Response(status, content=compressed, headers={
+            'Content-Encoding': 'gzip', 'Content-Length': str(len(compressed)),
+            'Content-Type': 'application/json', 'Retry-After': '2'})
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = EaselClient('https://easel.test', 'key', http_client=http)
+    if case == 'success':
+        assert client.get_model_guide('minimax-h3', 'base') == payload
+    elif case == 'oversize':
+        assert len(compressed) < 16 * 1024
+        with pytest.raises(EaselError, match='16 KiB'):
+            client.get_model_guide('minimax-h3', 'base')
+    else:
+        with pytest.raises(EaselError) as error:
+            client.get_model_guide('minimax-h3', 'base')
+        assert error.value.status_code == 404
+        assert error.value.code == 'model_guide_unavailable'
+        assert error.value.param == 'mode'
+        assert error.value.retry_after == 2
