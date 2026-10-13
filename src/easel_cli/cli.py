@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -220,9 +221,16 @@ def _print_json(body, api_key: str) -> str:
     return serialized
 
 
-def _receipt(body, path: Path | None, api_key: str) -> None:
+@dataclass
+class _Progress:
+    generation_started: bool = False
+    receipt_printed: bool = False
+
+
+def _receipt(body, path: Path | None, api_key: str, progress: _Progress) -> None:
     # Always expose the ID before disk writes or polling can fail.
     serialized = _print_json(body, api_key)
+    progress.receipt_printed = True
     if path is not None:
         _write_new(path, (serialized + "\n").encode())
 
@@ -231,7 +239,7 @@ def _wait(client, args, kind, job_id):
     return client.wait_for_job(kind, job_id, timeout=args.wait_timeout, poll_interval=args.poll_interval)
 
 
-def _run(client, args, api_key: str) -> None:
+def _run(client, args, api_key: str, progress: _Progress) -> None:
     if getattr(args, "receipt", None) and getattr(args, "wait", False):
         if args.receipt.resolve() == args.output.resolve():
             raise EaselError("Receipt and media output must use different filenames")
@@ -254,11 +262,12 @@ def _run(client, args, api_key: str) -> None:
                 _check_new(args.receipt)
             if args.wait:
                 _check_new(args.output)
+            progress.generation_started = True
             body = client.create_video(args.prompt, loras=args.lora if args.lora is not None else args.loras,
                 guiding_frames=guide_frames(args.guide_frame), **{name: getattr(args, name) for name in (
                 "model", "seconds", "size", "input_reference", "seed", "camera_lora", "camera_lora_strength",
                 "motion_speed", "lora_reference", "lora_reference_strength")})
-            _receipt(body, args.receipt, api_key)
+            _receipt(body, args.receipt, api_key, progress)
             if not args.wait:
                 return
             _wait(client, args, "video", body["id"])
@@ -300,14 +309,16 @@ def _run(client, args, api_key: str) -> None:
     if args.server:
         options["server"] = args.server
     if args.command == "generate" and not async_mode and args.response_format is None:
+        progress.generation_started = True
         images = client.generate(args.prompt, **options)
     else:
         operation = {"generate": "generations", "edit": "edits", "variation": "variations"}[args.command]
         refs = args.image if args.command == "edit" else [args.image] if args.command == "variation" else None
+        progress.generation_started = True
         body = client.image_request(operation, prompt=getattr(args, "prompt", None), images=refs,
             async_mode=async_mode, response_format=args.response_format or ("url" if async_mode else "b64_json"), **options)
         if async_mode:
-            _receipt(body, args.receipt, api_key)
+            _receipt(body, args.receipt, api_key, progress)
             if not args.wait:
                 return
             body = _wait(client, args, "image", body["id"])
@@ -322,19 +333,27 @@ def main(argv: list[str] | None = None) -> int:
     if credentials is None:
         return 2
     base_url, api_key = credentials
+    progress = _Progress()
     try:
         options = {"timeout": args.timeout}
         if args.max_download_mib != 512:
             options["max_download_bytes"] = int(args.max_download_mib * 1024 * 1024)
         with EaselClient(base_url, api_key, **options) as client:
-            _run(client, args, api_key)
+            _run(client, args, api_key, progress)
         return 0
     except (EaselError, httpx.HTTPError, OSError) as exc:
         message = str(exc).replace(api_key, "[REDACTED]")
         print(f"Easel: {message}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("Stopped monitoring. Accepted jobs keep running; resume with the printed ID, do not resubmit.", file=sys.stderr)
+        if progress.receipt_printed:
+            message = "Interrupted. Accepted jobs keep running; resume with the printed ID, do not resubmit."
+        elif progress.generation_started:
+            message = ("Interrupted. No job receipt was printed; generation may have been accepted. "
+                       "Check server job state before trying again; do not resubmit automatically.")
+        else:
+            message = "Interrupted."
+        print(message, file=sys.stderr)
         return 130
 
 
