@@ -1,0 +1,40 @@
+easel-cli
+Copyright (c) 2026 venetanji
+
+Project license: GPL-3.0-or-later
+
+The project-maintained source code, tests, documentation, and configuration in
+this revision are offered under the following terms, except for separately
+identified third-party material and retained historical license notices:
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+Historical MIT grant
+
+The initial revision ba2400ce22f1a4c9da4d6f5d2855aee309d7ffd9 was distributed
+under the MIT License. Its complete copyright and permission notice is retained
+unchanged in LICENSES/legacy-MIT.txt. Existing MIT grants for that material are
+not revoked. This change does not remove the rights already granted to use that
+material under MIT, nor does it claim to relicense other parties' work.
+
+Third-party scope
+
+Third-party dependencies and build tools retain their own licenses and notices.
+They are installed separately and are not relicensed by this project. Remote API
+services, ComfyUI, model weights, and other external resources are not included
+in the easel-cli source distribution or wheel. Their terms remain independent.
+Generated images are not automatically covered by this project's GPL grant;
+applicable service, model, and content rights must be considered separately.
+
+See docs/license-audit.md for the review scope and packaging checks.

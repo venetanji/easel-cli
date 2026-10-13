@@ -3,6 +3,8 @@ name = "easel-cli"
 version = "0.1.0"
 description = "Generate images and videos with Easel's job API"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE", "LICENSES/legacy-MIT.txt"]
 requires-python = ">=3.11"
 dependencies = ["httpx>=0.27"]
 
@@ -13,7 +15,7 @@ easel = "easel_cli.cli:main"
 dev = ["pytest>=8"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
