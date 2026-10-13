@@ -21,8 +21,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      # Deliberately fail if this repository's existing token cannot read the
-      # private server. Do not skip the contract or create new credentials.
+      # Check out the public server at the verified revision using the existing
+      # token. A checkout failure must fail the contract, never skip it.
       - uses: actions/checkout@v4
         with:
           repository: venetanji/easel
