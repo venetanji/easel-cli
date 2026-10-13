@@ -1,7 +1,7 @@
 [project]
 name = "easel-cli"
 version = "0.1.0"
-description = "Generate images from Easel's OpenAI-compatible API"
+description = "Generate images and videos with Easel's job API"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["httpx>=0.27"]
