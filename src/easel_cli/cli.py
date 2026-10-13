@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 
 from easel_cli.client import (EaselClient, EaselError, GuideFrame, LoRASelection,
-                              IMAGE_MODEL, VIDEO_MODEL, VIDEO_SIZES)
+                              IMAGE_MODEL, VIDEO_MODEL, VIDEO_MODELS, TemporalGroup)
 
 DEFAULT_BASE_URL = "https://easel.ait4x.org"
 
@@ -74,6 +74,17 @@ def guide_frames(values: list[list[str]] | None) -> list[GuideFrame] | None:
         raise EaselError("--guide-frame requires integer FRAME, IMAGE path and numeric STRENGTH") from exc
 
 
+def temporal_groups(values: list[list[str]] | None) -> list[TemporalGroup] | None:
+    if values is None:
+        return None
+    try:
+        if any(len(group) < 2 for group in values):
+            raise ValueError
+        return [TemporalGroup(int(group[0]), [Path(path) for path in group[1:]]) for group in values]
+    except ValueError as exc:
+        raise EaselError("--temporal-group requires integer FRAME and at least one IMAGE path") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="easel", description="Generate images and videos with Easel")
     parser.add_argument("--version", action="version", version="easel-cli 0.1.0")
@@ -117,11 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
     actions = video.add_subparsers(dest="action", required=True)
     create = actions.add_parser("create", help="submit a video once and print its receipt")
     create.add_argument("prompt")
-    create.add_argument("--model", default=VIDEO_MODEL)
-    create.add_argument("--seconds", type=int, choices=range(1, 13), default=4)
-    create.add_argument("--size", default="1280x720", choices=VIDEO_SIZES)
+    create.add_argument("--model", choices=VIDEO_MODELS, default=VIDEO_MODEL)
+    create.add_argument("--seconds", type=int, choices=range(1, 13), help="LTX only (default: 4); H3 uses --frames")
+    create.add_argument("--frames", type=int, help="H3 only; default/grid from current video capabilities")
+    create.add_argument("--size", help="LTX default: 1280x720; H3 presets/custom limits and default from capabilities")
     create.add_argument("--input-reference", type=Path)
     create.add_argument("--source-audio", type=Path, help="WAV/MP3/FLAC/Ogg/M4A; conditions video and supplies its trimmed soundtrack")
+    create.add_argument("--semantic-reference", action="append", type=Path, help="H3 PNG/JPEG semantic reference; repeat within capability limits")
+    create.add_argument("--temporal-group", action="append", nargs="+", metavar="FRAME/IMAGE", help="H3 FRAME IMAGE [IMAGE ...]; repeat for nonoverlapping groups within capability limits")
     create.add_argument("--seed", type=int)
     create.add_argument("--camera-lora", choices=("dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static"))
     create.add_argument("--camera-lora-strength", type=float)
@@ -143,8 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument("job_id")
     _add_connection_options(queue)
     loras = actions.add_parser("loras", help="discover supported/installed adapter capabilities as JSON")
+    loras.add_argument("--model", choices=VIDEO_MODELS)
     _add_connection_options(loras)
     capabilities = actions.add_parser("capabilities", help="discover video limits and guide support/availability as JSON")
+    capabilities.add_argument("--model", choices=VIDEO_MODELS)
     _add_connection_options(capabilities)
     return parser
 
@@ -250,10 +266,10 @@ def _run(client, args, api_key: str) -> None:
         return
     if args.command == "video":
         if args.action == "capabilities":
-            _print_json(client.video_capabilities(), api_key)
+            _print_json(client.video_capabilities(args.model) if args.model else client.video_capabilities(), api_key)
             return
         if args.action == "loras":
-            _print_json(client.list_loras(), api_key)
+            _print_json(client.list_loras(args.model) if args.model else client.list_loras(), api_key)
             return
         if args.action == "queue":
             _print_json(client.video_queue(args.job_id), api_key)
@@ -264,8 +280,9 @@ def _run(client, args, api_key: str) -> None:
             if args.wait:
                 _check_new(args.output)
             body = client.create_video(args.prompt, loras=args.lora if args.lora is not None else args.loras,
-                guiding_frames=guide_frames(args.guide_frame), **{name: getattr(args, name) for name in (
-                "model", "seconds", "size", "input_reference", "source_audio", "seed", "camera_lora", "camera_lora_strength",
+                guiding_frames=guide_frames(args.guide_frame),
+                semantic_references=args.semantic_reference, temporal_groups=temporal_groups(args.temporal_group), **{name: getattr(args, name) for name in (
+                "model", "seconds", "frames", "size", "input_reference", "source_audio", "seed", "camera_lora", "camera_lora_strength",
                 "motion_speed", "lora_reference", "lora_reference_strength")})
             _receipt(body, args.receipt, api_key)
             if not args.wait:

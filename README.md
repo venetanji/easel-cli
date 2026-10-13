@@ -85,12 +85,12 @@ easel video download VIDEO_ID -o fox-copy.mp4
 easel video create "gentle motion" --input-reference fox.png --seconds 2 --size 512x320 --wait --receipt motion-job.json -o motion.mp4
 ```
 
-Video creation uses multipart form data. Durations are whole seconds from 1–12
+Video creation uses multipart form data. For LTX, durations are whole seconds from 1–12
 (default 4); default size is `1280x720`. `512x320` is useful for bounded smoke
 tests. Nominal `1280x720` / `720x1280` currently decode at `1280x704` / `704x1280`.
 At 24 FPS the server produces `seconds * 24 + 1` frames.
 
-Camera flags: `--camera-lora static|dolly-in|dolly-out|dolly-left|dolly-right|jib-up|jib-down`
+LTX camera flags: `--camera-lora static|dolly-in|dolly-out|dolly-left|dolly-right|jib-up|jib-down`
 and optional `--camera-lora-strength` (finite 0–2, default 0.8). Use repeatable
 `--lora ID[=STRENGTH]` for up to four adapters, including the camera shorthand.
 Adapter strength defaults to 1 and must be finite 0–2. Legacy `--loras` JSON
@@ -111,7 +111,7 @@ easel video create "a forest scene" --seconds 5 --lora ingredients --lora-refere
 easel video create "one coherent shot" --seconds 2 --size 512x320 --lora camera-static=0.8 --guide-frame 1 "first image.png" 0.7 --guide-frame 48 last.png 0.3 --receipt guided-job.json
 ```
 
-`--seed` is an exact Python integer from 0 through 18446744073709551614.
+For LTX, `--seed` is an exact Python integer from 0 through 18446744073709551614. H3 seed bounds come from capabilities (currently through 18446744073709551615).
 `cinemagraph` requires `--input-reference` and cannot use moving camera LoRAs.
 `--lora-reference-strength` is finite 0–1, defaults to 1 and requires Ingredients.
 
@@ -140,19 +140,78 @@ validates decoding and duration, normalizes to 48 kHz stereo PCM WAV, conditions
 video, and supplies the trimmed source soundtrack. This is separate from Suno;
 there are no selectable copy/reference modes or universal perfect lip-sync claim.
 
-The confirmed H3 recipe belongs to **easel-client / MCP**, which supports H3
-creation: fetch `model-guide minimax-h3 --mode base`, check H3 capabilities, then
-use `model: "minimax-h3"`, `size: "768x512"`, `frames: 124`, first-image
-`input_reference`, and one WAV `source_audio`. Supply **no `seconds`**. Audio must
-cover `124/24 = 5.166667` seconds. The standalone MCP adapter represents audio as
-`sourceAudio: {data, mimeType: "audio/wav", name}` before serializing that multipart
-field; desktop uses `sourceAudioAssetId`. Compose the prompt from the retrieved
-base guide, keep the opening aligned with the image, and request visible
-articulation and pauses. This CLI retrieves H3 guides but does **not** support H3
-video generation; do not run `video create --model minimax-h3` as that recipe.
+### H3 image plus speech
+
+This CLI also supports `minimax-h3`. Retrieve the base guide before composing the
+prompt, then check exact-model runtime capabilities. Reuse that guide within the
+turn; the server owns its text and model constraints.
+
+```bash
+easel model-guide minimax-h3 --mode base
+easel video capabilities --model minimax-h3
+easel video loras --model minimax-h3
+# Compose PROMPT from the retrieved guide and your intended shot:
+easel video create "$PROMPT" --model minimax-h3 --frames 124 --size 768x512 \
+  --input-reference portrait.png --source-audio speech.wav --receipt h3-speech-job.json
+easel video wait VIDEO_ID --wait-timeout 1800 -o h3-speech.mp4
+```
+
+Keep the opening aligned with the portrait and describe visible articulation and
+closed lips during pauses. At the current 24 FPS, 124 frames require audio covering
+`124/24 = 5.166667` seconds (a six-second recording is sufficient). The server
+normalizes and trims the source soundtrack and uses it to condition motion.
+There is no guarantee of perfect lip-sync. H3 must omit `--seconds` and all LTX
+camera, LoRA, motion-speed, Ingredients and `--guide-frame` controls; supplying
+any of them is an error. LTX likewise rejects H3 frame/reference controls.
+
+H3 performs one current exact-model capability GET before POST. Frame defaults,
+min/max/grid, exact decimal seed bounds, size presets, aliases, custom dimension
+alignment and pixel/frame budgets come from that response. `--frames` and `--size`
+may be omitted for the advertised defaults (currently 124 and `864x480`). Unknown,
+malformed, mismatched or unavailable required contracts fail before submission.
+The selected profile must be supported and available; source audio additionally
+requires its capability. No runtime constraint or guide prose table is bundled.
+The server retains final decoding, geometry, pixel and resource validation.
+
+### H3 semantic and temporal references
+
+Use `model-guide minimax-h3 --mode reference` to compose a reference prompt.
+Repeat `--semantic-reference PATH` for semantic still references. Repeat
+`--temporal-group FRAME IMAGE [IMAGE ...]` for consecutive still images beginning
+at that pixel frame. Current capabilities allow two semantic references, three
+nonoverlapping temporal groups, and group image counts of 1, 5, 22 or 39; inspect
+the response for the current limits. Images in each group must share geometry.
+Groups must fit within the requested frames. These controls can combine with each
+other and source audio, but cannot combine with `--input-reference`.
+
+```bash
+easel model-guide minimax-h3 --mode reference
+easel video create "$PROMPT" --model minimax-h3 --frames 124 --size 768x512 \
+  --semantic-reference subject.png --temporal-group 0 opening.png \
+  --temporal-group 123 closing.jpg --receipt h3-reference-job.json
+```
+
+Only regular, nonempty PNG/JPEG still files are supported by H3. Each supplied
+reference is uploaded once as `images`; typed metadata holds sequential indices,
+never local paths. Image uploads share an independent 32 MiB safety bound; audio
+has its own 32 MiB bound, and lower advertised byte limits are respected.
+Pixel limits, still decoding and matching group geometry are checked by the server.
+
+```python
+from pathlib import Path
+from easel_cli.client import TemporalGroup
+
+receipt = client.create_video(
+    prompt, model="minimax-h3", frames=124, size="768x512",
+    semantic_references=[Path("subject.png")],
+    temporal_groups=[TemporalGroup(0, [Path("opening.png")]),
+                     TemporalGroup(123, [Path("closing.jpg")])],
+)
+```
+
 No live generation is part of this change's automated verification.
 
-### Temporal guiding frames
+### LTX temporal guiding frames
 
 Repeat `--guide-frame FRAME IMAGE STRENGTH` for one through eight still images.
 Frame positions are unique integers from 0 through `seconds * 24`, inclusive;
@@ -167,7 +226,7 @@ that guide images are decodable still images; animated PNG/WebP is rejected.
 limits and distinguishes guide `supported` code, live node `available` state,
 and `validation`. Temporal guides are `graph_contract_tested`, not GPU-execution
 or visual-quality validated. An older server without this endpoint fails
-explicitly. Basic creation does not require a discovery request, and advanced
+explicitly. Basic LTX creation does not require a discovery request, and advanced
 options are never silently dropped.
 
 Python callers can use typed inputs:
@@ -250,10 +309,12 @@ The baseline image/video job contract was audited against Easel
 See the pinned [image-job contract](https://github.com/venetanji/easel/blob/10f118a818615595d53521d0ddae02b9c1d14d27/IMAGE_JOBS.md)
 and [model-serving contract](https://github.com/venetanji/easel/blob/10f118a818615595d53521d0ddae02b9c1d14d27/MODEL_SERVING.md).
 The expanded contract suite requires an Easel checkout with video capabilities
-schema version 1, temporal guiding-frame support, shared model guides and source
+schema version 1, H3 native profiles, temporal guiding-frame support, shared model guides and source
 audio, plus `ffmpeg`/`ffprobe` on PATH. It checks guide identity, exact audio MIME
 and limit definitions, short tracks, source muxing, older/unavailable capabilities
-and one POST after an accepted receipt is lost. Missing checkout configuration
+and one POST after an accepted receipt is lost. H3 contracts cover T2V, I2V, image
+plus speech, semantic/temporal/mixed references, trimmed source graph wiring, native
+colon receipt IDs, queue/status/download and admission failures. Missing checkout configuration
 fails instead of silently skipping. See [local handoff](LOCAL_HANDOFF.md) for fresh
 agent instructions and local verification.
 These checks prove protocol compatibility with fake output bytes; they do not

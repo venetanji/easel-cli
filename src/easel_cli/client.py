@@ -20,6 +20,7 @@ import httpx
 
 IMAGE_MODEL = "qwen-image-2.1"
 VIDEO_MODEL = "ltx-2.5"
+VIDEO_MODELS = (VIDEO_MODEL, "minimax-h3")
 JOB_STATUSES = {"queued", "in_progress", "completed", "failed", "cancelled"}
 VIDEO_SIZES = ("512x320", "640x384", "768x512", "1280x720", "720x1280", "1792x1024", "1024x1792")
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
@@ -45,6 +46,13 @@ class GuideFrame:
     strength: float = 1.0
 
 
+@dataclass(frozen=True)
+class TemporalGroup:
+    """H3 consecutive still images beginning at a pixel-frame position."""
+    frame_index: int
+    images: list[Path]
+
+
 class LoRACatalogEntry(TypedDict, total=False):
     id: str
     kind: str
@@ -63,7 +71,7 @@ class LoRACatalogEntry(TypedDict, total=False):
     tested_workflows: list[str]
 
 
-class VideoCapabilities(TypedDict):
+class VideoCapabilities(TypedDict, total=False):
     object: str
     schema_version: int
     model: str
@@ -77,6 +85,13 @@ class VideoCapabilities(TypedDict):
     lora_reference_strength: dict[str, Any]
     uploads: dict[str, Any]
     guiding_frames: dict[str, Any]
+    frames: dict[str, int]
+    size_presets: list[dict[str, Any]]
+    size_constraints: dict[str, Any]
+    profiles: dict[str, dict[str, Any]]
+    source_audio: dict[str, Any]
+    semantic_references: dict[str, Any]
+    temporal_groups: dict[str, Any]
 
 
 class EaselError(Exception):
@@ -263,8 +278,18 @@ class EaselClient:
         except (KeyError, TypeError, AttributeError, ValueError) as exc:
             raise EaselError("Easel API returned an invalid models response") from exc
 
-    def list_loras(self) -> list[LoRACatalogEntry]:
-        data = self._get_json("/v1/videos/loras").get("data")
+    def list_loras(self, model: str | None = None) -> list[LoRACatalogEntry]:
+        if model is None:
+            body = self._get_json("/v1/videos/loras")
+        else:
+            self._video_model(model)
+            body = self._decode_response(self._http.get(
+                f"{self.base_url}/v1/videos/loras", params={"model": model},
+                headers=self._headers, follow_redirects=False, timeout=self.timeout))
+            if ((model == "minimax-h3" and body.get("model") != model)
+                    or ("model" in body and body["model"] != model)):
+                raise EaselError("Easel API returned a mismatched LoRA catalog model")
+        data = body.get("data")
         if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
             raise EaselError("Easel API returned an invalid LoRA catalog")
         for item in data:
@@ -280,12 +305,15 @@ class EaselClient:
         if model is None:
             body = self._get_json("/v1/videos/capabilities")
         else:
+            self._video_model(model)
             body = self._decode_response(self._http.get(
                 f"{self.base_url}/v1/videos/capabilities", params={"model": model},
                 headers=self._headers, follow_redirects=False, timeout=self.timeout))
         if (body.get("object") != "video.capabilities" or type(body.get("schema_version")) is not int
                 or body["schema_version"] != 1):
             raise EaselError("Easel API returned an unsupported video capabilities contract")
+        if model is not None and body.get("model") != model:
+            raise EaselError("Easel API returned mismatched video capabilities model (source_audio unavailable)")
         return cast(VideoCapabilities, body)
 
     @staticmethod
@@ -346,18 +374,35 @@ class EaselClient:
         kwargs.setdefault("response_format", "url")
         return self.image_request("generations", prompt=prompt, async_mode=True, **kwargs)
 
-    def create_video(self, prompt: str, *, model: str = VIDEO_MODEL, seconds: int = 4,
-                     size: str = "1280x720", input_reference: Path | None = None,
+    def create_video(self, prompt: str, *, model: str = VIDEO_MODEL, seconds: int | None = None,
+                     size: str | None = None, input_reference: Path | None = None,
                      camera_lora: str | None = None, camera_lora_strength: float | None = None,
                      loras: str | list[LoRASelection] | None = None, motion_speed: float | None = None,
                      seed: int | None = None, lora_reference: Path | None = None,
                      lora_reference_strength: float | None = None,
                      guiding_frames: list[GuideFrame] | None = None,
-                     source_audio: Path | None = None) -> dict[str, Any]:
+                     source_audio: Path | None = None, frames: int | None = None,
+                     semantic_references: list[Path] | None = None,
+                     temporal_groups: list[TemporalGroup] | None = None) -> dict[str, Any]:
         if not isinstance(prompt, str) or not prompt.strip():
             raise EaselError("prompt is required")
-        if not isinstance(model, str) or not model.strip():
-            raise EaselError("model is required")
+        self._video_model(model)
+        if model == "minimax-h3":
+            for name, value in (("seconds", seconds), ("camera_lora", camera_lora),
+                    ("camera_lora_strength", camera_lora_strength), ("loras", loras),
+                    ("motion_speed", motion_speed), ("lora_reference", lora_reference),
+                    ("lora_reference_strength", lora_reference_strength), ("guiding_frames", guiding_frames)):
+                if value is not None:
+                    raise EaselError(f"{name} is unsupported for minimax-h3")
+            return self._create_h3(prompt, frames=frames, size=size, seed=seed,
+                input_reference=input_reference, source_audio=source_audio,
+                semantic_references=semantic_references, temporal_groups=temporal_groups)
+        for name, value in (("frames", frames), ("semantic_references", semantic_references),
+                            ("temporal_groups", temporal_groups)):
+            if value is not None:
+                raise EaselError(f"{name} is unsupported for ltx-2.5")
+        seconds = 4 if seconds is None else seconds
+        size = "1280x720" if size is None else size
         _integer(seconds, "seconds", 1, 12)
         if size not in VIDEO_SIZES:
             raise EaselError("Unsupported video size")
@@ -448,6 +493,165 @@ class EaselClient:
                 files.append(("source_audio", (filename, content, mime)))
             body = self._submit("/v1/videos", files=files)
         self._validate_receipt(body, "video")
+        return body
+
+    @staticmethod
+    def _video_model(model: str) -> None:
+        if model not in VIDEO_MODELS:
+            raise EaselError("Unsupported video model; choose ltx-2.5 or minimax-h3")
+
+    @staticmethod
+    def _h3_contract(cap: dict[str, Any], *, source_audio: bool = False) -> None:
+        """Validate the bounded server-owned schema; unknown contracts grant no support."""
+        def positive(value: Any) -> bool:
+            return type(value) is int and value > 0
+        def require(condition: bool) -> None:
+            if not condition:
+                raise ValueError("malformed capability")
+        try:
+            grid, seed, sizes = cap['frames'], cap['seed'], cap['size_constraints']
+            require(all(type(grid[key]) is int for key in ('min','max','default','step','offset')))
+            require(0 < grid['min'] <= grid['default'] <= grid['max'] and grid['step'] > 0)
+            require(0 <= grid['offset'] < grid['step'] and (grid['default']-grid['offset']) % grid['step'] == 0)
+            require(seed['encoding'] == 'decimal_string')
+            require(all(isinstance(seed[key], str) and re.fullmatch(r'[0-9]{1,20}', seed[key]) for key in ('min','max')))
+            require(0 <= int(seed['min']) <= int(seed['max']))
+            require(positive(cap['fps']) and isinstance(cap['default_size'], str))
+            require(type(sizes['custom_sizes']) is bool and sizes['format'] == 'WIDTHxHEIGHT')
+            require(all(positive(sizes[key]) for key in ('min_dimension','max_dimension','dimension_multiple','max_pixels','max_pixel_frames')))
+            require(sizes['min_dimension'] <= sizes['max_dimension'])
+            require(isinstance(sizes['aliases'], dict))
+            require(all(isinstance(k,str) and isinstance(v,str) for k,v in sizes['aliases'].items()))
+            require(isinstance(cap['size_presets'],list))
+            seen = set()
+            for entry in cap['size_presets']:
+                require(isinstance(entry['size'],str) and entry['size'] not in seen)
+                seen.add(entry['size'])
+                require(all(positive(entry[key]) for key in ('width','height','max_frames')))
+            for name in ('fl8','ia2v_fl8','ref20','temporal_ref20'):
+                profile = cap['profiles'][name]
+                require(type(profile['supported']) is bool and type(profile['available']) is bool)
+            refs, groups, uploads = cap['semantic_references'], cap['temporal_groups'], cap['uploads']
+            require(positive(refs['max_count']) and refs['fields'] == ['image_index'])
+            require(positive(groups['max_count']) and groups['fields'] == ['frame_index','image_indices'])
+            require(isinstance(groups['image_counts'],list) and groups['image_counts'])
+            require(all(positive(count) for count in groups['image_counts']))
+            require(uploads['field'] == 'images' and positive(uploads['max_total_bytes']) and positive(uploads['max_count']))
+            require(all(positive(uploads[key]) for key in ('max_image_pixels','max_total_pixels')))
+            require(isinstance(uploads['mime_types'],list) and uploads['mime_types'])
+            require(all(mime in ('image/png','image/jpeg') for mime in uploads['mime_types']))
+            if source_audio:
+                audio = cap['source_audio']
+                require(type(audio['available']) is bool and audio['field'] == 'source_audio' and positive(audio['max_bytes']))
+                require(isinstance(audio['mime_types'],list) and audio['mime_types'])
+                require(all(isinstance(mime,str) for mime in audio['mime_types']))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EaselError("Easel API returned malformed or old H3 capabilities; update/check the server contract") from exc
+
+    def _create_h3(self, prompt: str, *, frames: int | None, size: str | None,
+                   seed: int | None, input_reference: Path | None, source_audio: Path | None,
+                   semantic_references: list[Path] | None,
+                   temporal_groups: list[TemporalGroup] | None) -> dict[str, Any]:
+        cap = self.video_capabilities("minimax-h3")
+        self._h3_contract(cap, source_audio=source_audio is not None)
+        grid = cap['frames']
+        frames = grid['default'] if frames is None else frames
+        _integer(frames, "frames", grid['min'], grid['max'])
+        if (frames - grid['offset']) % grid['step']:
+            raise EaselError("frames must lie on the current capability step/offset grid")
+        if seed is not None:
+            _integer(seed, "seed", int(cap['seed']['min']), int(cap['seed']['max']))
+        size = cap['default_size'] if size is None else size
+        if not isinstance(size, str):
+            raise EaselError("size must use WIDTHxHEIGHT format")
+        size = size.strip().lower()
+        constraints = cap['size_constraints']
+        preset = next((entry for entry in cap['size_presets'] if entry['size'] == size), None)
+        if preset is not None:
+            width, height = preset['width'], preset['height']
+            if frames > preset['max_frames']:
+                raise EaselError("frames exceed the current size preset resource budget")
+        else:
+            if constraints['custom_sizes'] is not True:
+                raise EaselError("size is not an advertised preset; custom sizes are unavailable")
+            effective = constraints['aliases'].get(size, size)
+            if not re.fullmatch(r'[0-9]{3,4}x[0-9]{3,4}', effective):
+                raise EaselError("size must use WIDTHxHEIGHT format")
+            width, height = (int(part) for part in effective.split('x'))
+        if any(not constraints['min_dimension'] <= value <= constraints['max_dimension']
+               or value % constraints['dimension_multiple'] for value in (width,height)):
+            raise EaselError("size dimensions violate the current capability bounds/alignment")
+        if width * height > constraints['max_pixels'] or width * height * frames > constraints['max_pixel_frames']:
+            raise EaselError("size/frames exceed the current video resource budget; reduce size or frames")
+        refs, groups = [], []
+        references: list[tuple[str, Path]] = []
+        if input_reference is not None and (semantic_references is not None or temporal_groups is not None):
+            raise EaselError("input_reference cannot be combined with semantic_references or temporal_groups")
+        if input_reference is not None:
+            references.append(('input_reference',input_reference))
+        if semantic_references is not None:
+            if not isinstance(semantic_references,list) or not 1 <= len(semantic_references) <= cap['semantic_references']['max_count']:
+                raise EaselError("semantic_references exceeds the current capability count or is empty")
+            for path in semantic_references:
+                refs.append({'image_index':len(references)})
+                references.append(('images',path))
+        if temporal_groups is not None:
+            if not isinstance(temporal_groups,list) or not 1 <= len(temporal_groups) <= cap['temporal_groups']['max_count']:
+                raise EaselError("temporal_groups exceeds the current capability count or is empty")
+            for group in temporal_groups:
+                if not isinstance(group,TemporalGroup) or not isinstance(group.images,list) or len(group.images) not in cap['temporal_groups']['image_counts']:
+                    raise EaselError("temporal_groups requires TemporalGroup objects with an advertised image count")
+                _integer(group.frame_index,'temporal frame_index',0,frames-len(group.images))
+                indices = list(range(len(references),len(references)+len(group.images)))
+                groups.append({'frame_index':group.frame_index,'image_indices':indices})
+                references.extend(('images',path) for path in group.images)
+            ordered = sorted(groups,key=lambda group:group['frame_index'])
+            for previous,current in zip(ordered,ordered[1:]):
+                if previous['frame_index'] + len(previous['image_indices']) > current['frame_index']:
+                    raise EaselError("temporal_groups must not overlap")
+        if len(references) > cap['uploads']['max_count']:
+            raise EaselError("reference images exceed the current capability upload count")
+        profile = 'temporal_ref20' if groups else 'ref20' if refs else 'ia2v_fl8' if source_audio is not None else 'fl8'
+        if cap['profiles'][profile]['supported'] is not True or cap['profiles'][profile]['available'] is not True:
+            raise EaselError(f"H3 {profile} profile is unavailable; check current video capabilities")
+        if source_audio is not None and cap['source_audio']['available'] is not True:
+            raise EaselError("H3 source_audio is unavailable; check current video capabilities")
+        fields = {'model':'minimax-h3','prompt':prompt,'frames':frames,'size':size,'seed':seed,
+                  'semantic_references':json.dumps(refs,separators=(',',':')) if refs else None,
+                  'temporal_groups':json.dumps(groups,separators=(',',':')) if groups else None}
+        if any(len(fields[name] or '') > 8192 for name in ('semantic_references','temporal_groups')):
+            raise EaselError("H3 reference metadata exceeds 8192 characters")
+        files = [(name,(None,str(value))) for name,value in fields.items() if value is not None]
+        with ExitStack() as stack:
+            image_limit = min(MAX_UPLOAD_BYTES,cap['uploads']['max_total_bytes'])
+            total = 0
+            for name,path in references:
+                if not isinstance(path,(str,Path)) or not str(path):
+                    raise EaselError("Each H3 reference requires an image path")
+                filename,handle,mime = self._upload(stack,path)
+                if mime not in cap['uploads']['mime_types']:
+                    raise EaselError("H3 reference MIME type is unavailable; consult current capabilities (PNG/JPEG)")
+                remaining = image_limit-total
+                if os.fstat(handle.fileno()).st_size > remaining:
+                    raise EaselError("Combined H3 reference uploads exceed the image byte limit")
+                content = handle.read(remaining+1)
+                total += len(content)
+                if not content or total > image_limit:
+                    raise EaselError("H3 reference uploads must be nonempty and within the image byte limit")
+                files.append((name,(filename,content,mime)))
+            if source_audio is not None:
+                filename,handle,mime = self._upload(stack,source_audio,audio=True)
+                audio_limit = min(MAX_AUDIO_BYTES,cap['source_audio']['max_bytes'])
+                if mime not in cap['source_audio']['mime_types']:
+                    raise EaselError("source_audio MIME type is unavailable; consult current capabilities")
+                if os.fstat(handle.fileno()).st_size > audio_limit:
+                    raise EaselError("source_audio exceeds the audio byte limit")
+                content = handle.read(audio_limit+1)
+                if not content or len(content)>audio_limit:
+                    raise EaselError("source_audio must be nonempty and within the audio byte limit")
+                files.append(('source_audio',(filename,content,mime)))
+            body = self._submit('/v1/videos',files=files)
+        self._validate_receipt(body,'video')
         return body
 
     @staticmethod

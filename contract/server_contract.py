@@ -341,3 +341,83 @@ def test_lost_audio_receipt_never_double_posts(api, tmp_path, monkeypatch):
         client.create_video('speaking', seconds=1, source_audio=audio_file(tmp_path, 2))
     assert posts == ['https://easel.test/v1/videos']
     assert len(video.submissions) == 1
+
+
+@pytest.fixture
+def h3_api(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from easel.app import create_app
+    from easel.config import Settings
+    from tests.test_h3_api import H3Comfy
+    monkeypatch.setenv('EASEL_JOB_DIR',str(tmp_path/'h3-cache'))
+    backend=H3Comfy()
+    backend.schemas.update(AUDIO_SCHEMAS)
+    settings=dataclasses.replace(Settings.from_env({}),api_key='offline-contract-key',
+        comfy_video_url='http://fake-h3',image_job_dir=str(tmp_path/'jobs'))
+    with TestClient(create_app(settings=settings,comfy=backend,comfy_video=backend),base_url='https://easel.test') as http:
+        yield EaselClient('https://easel.test','offline-contract-key',http_client=http),backend
+
+
+def h3_image(tmp_path,name='portrait.png',size=(8,8)):
+    from PIL import Image
+    path=tmp_path/name;Image.new('RGB',size,'red').save(path);return path
+
+
+@pytest.mark.parametrize('mode',['t2v','i2v','speech','semantic','temporal','mixed','t2v-speech','semantic-speech','temporal-speech'])
+def test_h3_native_modes_receipt_poll_download(h3_api,tmp_path,mode):
+    from easel_cli.client import TemporalGroup
+    client,backend=h3_api
+    image=h3_image(tmp_path);kw={}
+    if mode in ('i2v','speech'):kw['input_reference']=image
+    if mode=='speech' or mode.endswith('-speech'):kw['source_audio']=audio_file(tmp_path,6)
+    if mode in ('semantic','mixed','semantic-speech'):kw['semantic_references']=[image]
+    if mode in ('temporal','mixed','temporal-speech'):kw['temporal_groups']=[TemporalGroup(0,[image]*5)]
+    receipt=client.create_video('visible articulation; closed lips during pauses',model='minimax-h3',
+        frames=124,size='768x512',seed=2**64-1,**kw)
+    assert (receipt['frames'],receipt['fps'],receipt['duration'])==(124,24,124/24)
+    assert ':' in receipt['id']
+    assert client.get_job('video',receipt['id'])['status']=='queued'
+    assert client.video_queue(receipt['id'])['queue_position']==1
+    graph=backend.submitted_graph
+    nodes=lambda kind: [(key,node['inputs']) for key,node in graph.items() if node['class_type']==kind]
+    assert nodes('RandomNoise')[0][1]['noise_seed']==2**64-1
+    if 'source_audio' in kw:
+        trim_key,trim=nodes('TrimAudioDuration')[0]
+        assert trim['duration']==124/24 and trim['start_index']==0
+        assert nodes('CreateVideo')[0][1]['audio']==[trim_key,0]
+        assert [inputs['audio'] for _,inputs in nodes('MiniMaxH3AddGuide') if 'audio' in inputs]==[[trim_key,0]]
+        assert not nodes('VAEDecodeAudio')
+        uploaded,_,_=next(item for item in backend.uploaded if item[2]=='audio/wav')
+        with wave.open(io.BytesIO(uploaded),'rb') as audio:
+            assert (audio.getframerate(),audio.getnchannels(),audio.getnframes())==(48000,2,248000)
+    if mode in ('semantic','temporal','mixed','semantic-speech','temporal-speech'):assert nodes('BasicScheduler')[0][1]['steps']==20
+    backend.history={'status':{'completed':True},'outputs':{'save':{'videos':[{'filename':'h3.mp4','type':'output'}]}}}
+    assert client.wait_for_job('video',receipt['id'],timeout=2)['status']=='completed'
+    assert client.download_video(receipt['id'])==b'mp4-output'
+
+
+@pytest.mark.parametrize('fault',['short','invalid-image','geometry','unavailable','queue'])
+def test_h3_admission_failure_has_no_submission(h3_api,tmp_path,fault):
+    from easel_cli.client import TemporalGroup
+    client,backend=h3_api;kw={}
+    if fault=='short':kw.update(input_reference=h3_image(tmp_path),source_audio=audio_file(tmp_path,5))
+    elif fault=='invalid-image':
+        path=tmp_path/'bad.png';path.write_bytes(b'bad');kw['input_reference']=path
+    elif fault=='geometry':kw['temporal_groups']=[TemporalGroup(0,[h3_image(tmp_path,'a.png'),h3_image(tmp_path,'b.png',(9,8))]+[h3_image(tmp_path)]*3)]
+    elif fault=='unavailable':backend.schemas.pop('MiniMaxH3ImageToVideo')
+    else:
+        async def full():return {'queue_running':[],'queue_pending':[[i,f'existing-{i}'] for i in range(8)]}
+        backend.queue=full
+    with pytest.raises(EaselError):client.create_video('shot',model='minimax-h3',**kw)
+    assert backend.submitted_graph is None and not backend.uploaded
+
+
+def test_h3_lost_response_posts_once(h3_api,tmp_path,monkeypatch):
+    client,backend=h3_api;original=client._http.post;posts=[]
+    def lose(*args,**kwargs):
+        posts.append(args[0]);response=original(*args,**kwargs);assert response.is_success
+        raise httpx.ReadError('receipt lost')
+    monkeypatch.setattr(client._http,'post',lose)
+    with pytest.raises(EaselError,match='ambiguous'):
+        client.create_video('shot',model='minimax-h3',input_reference=h3_image(tmp_path),source_audio=audio_file(tmp_path,6))
+    assert posts==['https://easel.test/v1/videos'] and backend.submitted_graph is not None

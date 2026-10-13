@@ -194,3 +194,26 @@ def test_invalid_advanced_cli_controls_do_not_submit(api, flags):
     except SystemExit as exc:
         assert exc.code == 2
     assert calls == []
+
+
+def test_h3_cli_receipt_saved_before_first_poll(api,tmp_path,monkeypatch,capsys):
+    from test_h3 import capabilities,fields
+    calls,responses=api
+    job_id='video_1_bWluaW1heC1oMw:124:768x512_native'
+    image=tmp_path/'portrait.png';image.write_bytes(b'image')
+    audio=tmp_path/'speech.wav';audio.write_bytes(b'audio')
+    responses.extend([httpx.Response(200,json=capabilities()),
+        httpx.Response(200,json={'id':job_id,'status':'queued'}),
+        httpx.Response(200,json={'id':job_id,'status':'completed'}),httpx.Response(200,content=b'mp4')])
+    original=EaselClient.get_job
+    def poll(self,*args,**kwargs):
+        assert json.loads((tmp_path/'h3.json').read_text())['id']==job_id
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(EaselClient,'get_job',poll)
+    assert cli.main(['video','create','articulation and pauses','--model','minimax-h3',
+        '--frames','124','--size','768x512','--input-reference',str(image),'--source-audio',str(audio),
+        '--wait','--receipt','h3.json','--output','h3.mp4'])==0
+    assert (tmp_path/'h3.mp4').read_bytes()==b'mp4'
+    assert [c.method for c in calls]==['GET','POST','GET','GET']
+    assert 'seconds' not in fields(calls[1])
+    assert job_id in capsys.readouterr().out
