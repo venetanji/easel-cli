@@ -14,3 +14,30 @@ jobs:
           enable-cache: true
       - run: uv run --group dev pytest -q
       - run: uv build
+
+  server-contract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # Check out the public server at the verified revision using the existing
+      # token. A checkout failure must fail the contract, never skip it.
+      - uses: actions/checkout@v4
+        with:
+          repository: venetanji/easel
+          ref: 4c114e5642c7db875ffafb3ae3c70a21183032ad
+          path: contract-server
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install audio contract tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Verify audio executables
+        run: command -v ffmpeg && command -v ffprobe
+      - name: Verify production CLI against pinned server
+        working-directory: contract-server
+        env:
+          EASEL_SERVER_SOURCE: ${{ github.workspace }}/contract-server
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: uv run --group dev pytest -q -rs ../contract/server_contract.py
