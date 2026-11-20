@@ -21,6 +21,24 @@ except for loopback HTTP (`localhost`, `127.0.0.1`, `[::1]`) during local tests.
 Connection flags belong after the leaf command. `--api-key` is available, but an
 environment variable avoids putting the key in shell history/process arguments.
 
+## Agent Skill
+
+Codex discovers the bundled [Easel CLI skill](.agents/skills/easel-cli/SKILL.md)
+when run in this checkout. Select it explicitly with `$easel-cli` or ask for an
+Easel CLI workflow such as a Qwen edit, an H3 portrait with speech, or resuming a
+video job.
+
+To use it from another project, copy the entire `.agents/skills/easel-cli`
+directory, including `references/`, into that project's `.agents/skills/`.
+For user-wide Codex discovery, use `~/.agents/skills/`. Other Agent Skills
+hosts can load the same folder from their configured skills directory.
+Install the CLI separately and make `easel` available on PATH.
+
+```bash
+uv tool install git+https://github.com/venetanji/easel-cli
+easel --help
+```
+
 ## Shared prompt guides
 
 Fetch the selected model/mode guide before composing a generation prompt and reuse
